@@ -7,6 +7,9 @@ so every subpath is a transparent passthrough:
   GET  /health
   GET  /v1/models
   POST /v1/chat/completions           (streaming SSE + non-streaming)
+  POST /v1/videos                     (OpenAI video format: create async task)
+  GET  /v1/videos/{task_id}           (OpenAI video format: task status)
+  GET  /v1/videos/{task_id}/content   (OpenAI video format: proxy download)
   POST /v1/images/{subpath:path}      (transparent proxy, e.g. /generations)
   GET  /v1/images/{subpath:path}      (transparent proxy, e.g. /tasks/{id})
   POST /v1/videos/{subpath:path}      (transparent proxy, e.g. /generations)
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -58,6 +62,39 @@ def _upstream_url(base: str, request: Request) -> str:
     if request.url.query:
         path = f"{path}?{request.url.query}"
     return f"{base}{path}"
+
+
+_VIDEO_STATUS_MAP = {
+    "pending": "queued",
+    "queued": "queued",
+    "in_progress": "in_progress",
+    "incomplete": "in_progress",
+    "completed": "completed",
+    "failed": "failed",
+    "error": "failed",
+}
+
+
+def _map_video_status(raw: str) -> str:
+    return _VIDEO_STATUS_MAP.get(raw, raw)
+
+
+def _video_progress(status: str) -> int:
+    if status in ("completed", "failed"):
+        return 100
+    if status == "in_progress":
+        return 50
+    return 0
+
+
+def _output_urls(data: dict) -> list:
+    out = data.get("output")
+    if not isinstance(out, dict):
+        return []
+    items = out.get("data")
+    if not isinstance(items, list):
+        return []
+    return [it["url"] for it in items if isinstance(it, dict) and it.get("url")]
 
 
 def create_app(cfg: GatewayConfig) -> FastAPI:
@@ -192,6 +229,118 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
             status_code=resp.status_code,
             media_type=ct,
         )
+
+    @app.post("/v1/videos")
+    async def videos_create(request: Request):
+        """OpenAI video format: create an async video task."""
+        if not _auth_ok(request):
+            return _unauthorized()
+        body = await request.json()
+        if not body.get("model"):
+            return _bad_request("'model' is required")
+        if not body.get("prompt"):
+            return _bad_request("'prompt' is required")
+        up_cfg = cfg.upstreams["video"]
+        body["model"] = up_cfg.resolve_model(body["model"])
+        body["background"] = "pending"
+        client = up.get_client(cfg, "video")
+        resp = await client.post(f"{client._raw_base}/v1/videos/generations", json=body)
+        if resp.status_code != 200:
+            return _upstream_error(resp)
+        data = resp.json()
+        status = _map_video_status(data.get("status", "pending"))
+        result = {
+            "id": data.get("id"),
+            "task_id": data.get("id"),
+            "object": "video",
+            "model": up_cfg.to_client_name(body["model"]),
+            "status": status,
+            "progress": _video_progress(status),
+            "created_at": data.get("created_at", int(time.time())),
+        }
+        if body.get("seconds") is not None:
+            result["seconds"] = body["seconds"]
+        if body.get("size") is not None:
+            result["size"] = body["size"]
+        return JSONResponse(result)
+
+    @app.get("/v1/videos/{task_id}/content")
+    async def videos_content(task_id: str, request: Request):
+        """OpenAI video format: proxy download of the finished video."""
+        if not _auth_ok(request):
+            return _unauthorized()
+        client = up.get_client(cfg, "video")
+        resp = await client.get(f"{client._raw_base}/v1/videos/tasks/{task_id}")
+        if resp.status_code != 200:
+            return _upstream_error(resp)
+        data = resp.json()
+        status = _map_video_status(data.get("status", "pending"))
+        if status != "completed":
+            return JSONResponse(
+                {"error": {"message": f"task not completed (status={status})",
+                           "type": "invalid_request_error", "code": "task_not_completed"}},
+                status_code=409,
+            )
+        urls = _output_urls(data)
+        if not urls:
+            return JSONResponse(
+                {"error": {"message": "no output url in task",
+                           "type": "upstream_error", "code": "no_output"}},
+                status_code=502,
+            )
+        media = await client.get(urls[0])
+        if media.status_code != 200:
+            return _upstream_error(media)
+        ct = media.headers.get("content-type", "video/mp4")
+
+        async def gen():
+            try:
+                async for chunk in media.aiter_bytes():
+                    yield chunk
+            finally:
+                await media.aclose()
+
+        return StreamingResponse(
+            gen(),
+            media_type=ct,
+            headers={"Content-Disposition": f'attachment; filename="video_{task_id}.mp4"'},
+        )
+
+    @app.get("/v1/videos/{task_id}")
+    async def videos_status(task_id: str, request: Request):
+        """OpenAI video format: task status / video object."""
+        if not _auth_ok(request):
+            return _unauthorized()
+        client = up.get_client(cfg, "video")
+        resp = await client.get(f"{client._raw_base}/v1/videos/tasks/{task_id}")
+        if resp.status_code == 404:
+            return JSONResponse(
+                {"error": {"message": "task_origin_not_exist", "type": "new_api_error",
+                           "param": "", "code": "task_not_exist"}},
+                status_code=404,
+            )
+        if resp.status_code != 200:
+            return _upstream_error(resp)
+        data = resp.json()
+        status = _map_video_status(data.get("status", "pending"))
+        result = {
+            "id": data.get("id", task_id),
+            "task_id": data.get("id", task_id),
+            "object": "video",
+            "status": status,
+            "progress": _video_progress(status),
+            "created_at": data.get("created_at"),
+        }
+        if data.get("model"):
+            result["model"] = cfg.upstreams["video"].to_client_name(data["model"])
+        if status == "completed":
+            result["completed_at"] = data.get("completed_at", int(time.time()))
+            if _output_urls(data):
+                result["video_url"] = f"{request.base_url}v1/videos/{task_id}/content"
+        if status == "failed":
+            result["error"] = {"message": str(data.get("error") or "generation failed"),
+                               "code": "generation_failed"}
+        return JSONResponse(result)
 
     @app.post("/v1/images/{subpath:path}")
     async def images_post(request: Request, subpath: str):
