@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -95,6 +96,30 @@ def _output_urls(data: dict) -> list:
     if not isinstance(items, list):
         return []
     return [it["url"] for it in items if isinstance(it, dict) and it.get("url")]
+
+
+def _parse_multipart_fields(raw: bytes, content_type: str) -> dict:
+    """Parse multipart/form-data into a flat dict of text fields."""
+    m = re.search(r"boundary=(\"([^\"]+)\"|([^;]+))", content_type)
+    if not m:
+        return {}
+    boundary = ("--" + (m.group(2) or m.group(3))).encode("latin-1")
+    fields: dict = {}
+    for part in raw.split(boundary):
+        part = part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        sep = part.find(b"\r\n\r\n")
+        if sep == -1:
+            continue
+        head = part[:sep].decode("latin-1", errors="replace")
+        value = part[sep + 4:]
+        if value.endswith(b"\r\n"):
+            value = value[:-2]
+        dm = re.search(r'name="([^"]+)"', head)
+        if dm:
+            fields[dm.group(1)] = value.decode("utf-8", errors="replace")
+    return fields
 
 
 def create_app(cfg: GatewayConfig) -> FastAPI:
@@ -235,7 +260,21 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         """OpenAI video format: create an async video task."""
         if not _auth_ok(request):
             return _unauthorized()
-        body = await request.json()
+        raw = await request.body()
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("application/json"):
+            try:
+                body = json.loads(raw)
+            except (ValueError, TypeError):
+                return _bad_request("invalid JSON body")
+        elif content_type.startswith("multipart/form-data"):
+            body = _parse_multipart_fields(raw, content_type)
+            if not body:
+                return _bad_request("no form fields found")
+        else:
+            return _bad_request(
+                "unsupported content-type (use application/json or multipart/form-data)"
+            )
         if not body.get("model"):
             return _bad_request("'model' is required")
         if not body.get("prompt"):
