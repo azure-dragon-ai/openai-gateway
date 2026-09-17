@@ -282,6 +282,15 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         up_cfg = cfg.upstreams["video"]
         body["model"] = up_cfg.resolve_model(body["model"])
         body["background"] = "pending"
+        # Upstream (roundabout minimax-h3) reads `duration`, not `seconds`.
+        # OpenAI-style clients send `seconds`; map it so duration is honored.
+        if body.get("duration") is None and body.get("seconds") is not None:
+            try:
+                # Upstream minimax-h3 hard limit: 1..15 seconds; clamp above 15.
+                body["duration"] = min(int(str(body["seconds"]).strip()), 15)
+            except ValueError:
+                return _bad_request("'seconds' must be an integer number of seconds")
+        body.pop("seconds", None)
         client = up.get_client(cfg, "video")
         resp = await client.post(f"{client._raw_base}/v1/videos/generations", json=body)
         if resp.status_code != 200:
