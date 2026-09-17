@@ -1,0 +1,33 @@
+# openai-gateway configuration
+#
+# Each capability routes to its own upstream with an independent
+# base_url / api_key / model mapping. base_url should be the OpenAI-style
+# API root including /v1 (subpaths are appended to it).
+
+server:
+  host: 0.0.0.0
+  port: 8800
+  api_key: ""            # empty = no auth required on the gateway side
+
+chat:
+  base_url: "http://[2408:8207:60ad:6cb0:706b:f65c:1fb2:4b01]:8000/v1"
+  api_key: "not-needed"
+  timeout: 900
+  models:
+    qwen3.8-27b: "Qwen3.8-27B"
+
+image:
+  base_url: "http://192.168.31.198:20003/v1"
+  api_key: ""
+  timeout: 600
+  models:
+    minimax-h3: "minimax-h3"
+    minimax-h3-turbo: "minimax-h3-turbo"
+
+video:
+  base_url: "http://192.168.31.198:20003/v1"
+  api_key: ""
+  timeout: 1800
+  models:
+    minimax-h3: "minimax-h3"
+    minimax-h3-turbo: "minimax-h3-turbo"
