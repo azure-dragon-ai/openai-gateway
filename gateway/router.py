@@ -225,8 +225,8 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
 
         raw = await request.body()
         body = None
+        content_type = request.headers.get("content-type", "")
         if request.method in ("POST", "PUT") and raw:
-            content_type = request.headers.get("content-type", "")
             if content_type.startswith("application/json"):
                 try:
                     body = json.loads(raw)
@@ -238,7 +238,12 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         if body is not None:
             resp = await client.request(request.method, target, json=body)
         else:
-            resp = await client.request(request.method, target, content=raw)
+            # Forward the original Content-Type verbatim. Multipart bodies
+            # carry their `boundary=` inside this header, and upstream
+            # multipart readers (aiohttp request.multipart()) raise
+            # KeyError('Content-Type') without it.
+            fwd = {"content-type": content_type} if content_type else {}
+            resp = await client.request(request.method, target, content=raw, headers=fwd)
 
         if resp.status_code != 200:
             return _upstream_error(resp)
