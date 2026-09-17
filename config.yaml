@@ -10,24 +10,27 @@ server:
   api_key: ""            # empty = no auth required on the gateway side
 
 chat:
-  base_url: "http://[2408:8207:60ad:6cb0:706b:f65c:1fb2:4b01]:8000/v1"
+  base_url: "http://[2408:8207:60ad:6cb0:706b:f65c:1fb2:4b01]:8000"
   api_key: "not-needed"
   timeout: 900
   models:
     qwen3.8-27b: "Qwen3.8-27B"
 
 image:
-  base_url: "http://192.168.31.198:20003/v1"
+  base_url: "http://192.168.31.197:10003"
   api_key: ""
   timeout: 600
   models:
+    z-image: "z-image"
+    z-image-turbo: "z-image-turbo"
     minimax-h3: "minimax-h3"
     minimax-h3-turbo: "minimax-h3-turbo"
 
 video:
-  base_url: "http://192.168.31.198:20003/v1"
+  base_url: "http://192.168.31.197:10003"
   api_key: ""
   timeout: 1800
   models:
+    z-image-turbo: "z-image-turbo"
     minimax-h3: "minimax-h3"
     minimax-h3-turbo: "minimax-h3-turbo"

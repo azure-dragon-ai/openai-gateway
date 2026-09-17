@@ -1,6 +1,9 @@
 """OpenAI-compatible gateway routes.
 
-Exposed endpoints:
+The gateway forwards the client's original /v1 path verbatim to the
+configured upstream root (base_url is the service root WITHOUT /v1),
+so every subpath is a transparent passthrough:
+
   GET  /health
   GET  /v1/models
   POST /v1/chat/completions           (streaming SSE + non-streaming)
@@ -16,6 +19,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import upstream as up
@@ -46,6 +50,16 @@ def _upstream_error(resp) -> Response:
     )
 
 
+def _upstream_url(base: str, request: Request) -> str:
+    """Forward the client's original /v1 path to the upstream root verbatim."""
+    path = request.url.path
+    if not path.startswith("/v1"):
+        path = f"/v1{path}"
+    if request.url.query:
+        path = f"{path}?{request.url.query}"
+    return f"{base}{path}"
+
+
 def create_app(cfg: GatewayConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -53,6 +67,12 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         await up.close_all()
 
     app = FastAPI(title="openai-gateway", version="1.0.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     def _auth_ok(request: Request) -> bool:
         if not cfg.server.api_key:
@@ -97,11 +117,12 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         body["model"] = chat_cfg.resolve_model(model)
 
         client = up.get_client(cfg, "chat")
+        target = _upstream_url(client._raw_base, request)
 
         if body.get("stream"):
             # Open the upstream response first so we can surface non-200
             # statuses before the streaming response is committed.
-            req = client.build_request("POST", "/chat/completions", json=body)
+            req = client.build_request("POST", target, json=body)
             resp = await client.send(req, stream=True)
             if resp.status_code != 200:
                 err = await resp.aread()
@@ -124,7 +145,7 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
                 media_type=resp.headers.get("content-type", "text/event-stream"),
             )
 
-        resp = await client.post("/chat/completions", json=body)
+        resp = await client.post(target, json=body)
         if resp.status_code != 200:
             return _upstream_error(resp)
         data = resp.json()
@@ -133,15 +154,12 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         return JSONResponse(data)
 
     async def _proxy(request: Request, category: str, subpath: str):
-        """Transparent proxy for images/videos subpaths (generations, tasks...)."""
+        """Transparent proxy: forward the client's /v1 path verbatim."""
         if not _auth_ok(request):
             return _unauthorized()
         up_cfg = cfg.upstreams[category]
         client = up.get_client(cfg, category)
-
-        path = f"/{subpath}" if subpath else "/"
-        if request.url.query:
-            path = f"{path}?{request.url.query}"
+        target = _upstream_url(client._raw_base, request)
 
         raw = await request.body()
         body = None
@@ -156,9 +174,9 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
                     body["model"] = up_cfg.resolve_model(body["model"])
 
         if body is not None:
-            resp = await client.request(request.method, path, json=body)
+            resp = await client.request(request.method, target, json=body)
         else:
-            resp = await client.request(request.method, path, content=raw)
+            resp = await client.request(request.method, target, content=raw)
 
         if resp.status_code != 200:
             return _upstream_error(resp)
