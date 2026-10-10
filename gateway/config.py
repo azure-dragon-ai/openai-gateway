@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -34,6 +35,10 @@ class UpstreamConfig:
     timeout: float = 300.0
     models: dict[str, str] = field(default_factory=dict)
     serialize: bool = False
+    #: Any yaml key beyond the ones above. Lets a category carry its own
+    #: adapter settings (e.g. audio's voice whitelists) without touching this
+    #: parser every time.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def resolve_model(self, client_model: str) -> str:
         """Map a client-facing model name to the upstream model name.
@@ -92,6 +97,11 @@ class GatewayConfig:
         return None
 
 
+#: Upstream keys mapped onto UpstreamConfig fields; everything else in the
+#: section lands in `extras`.
+_CORE_UPSTREAM_KEYS = {"base_url", "api_key", "timeout", "models", "serialize"}
+
+
 def _parse_upstream(name: str, raw: dict) -> UpstreamConfig:
     if not isinstance(raw, dict) or "base_url" not in raw:
         raise ValueError(f"upstream section '{name}' missing required field: base_url")
@@ -101,6 +111,7 @@ def _parse_upstream(name: str, raw: dict) -> UpstreamConfig:
         timeout=float(raw.get("timeout", 300.0)),
         models={str(k): str(v) for k, v in (raw.get("models") or {}).items()},
         serialize=bool(raw.get("serialize", False)),
+        extras={k: v for k, v in raw.items() if k not in _CORE_UPSTREAM_KEYS},
     )
 
 

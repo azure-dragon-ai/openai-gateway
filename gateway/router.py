@@ -87,6 +87,27 @@ _UPSTREAM_AUDIO_DELIVERY = {"b64_json", "url", "file", "path"}
 # ComfyUI blow up three layers down.
 _MIN_AUDIO_INPUT_CHARS = 10
 
+# OpenAI's TTS `voice` picks one of OpenAI's own speaker names. Upstream feeds
+# `voice` straight into the Qwen3-TTS engine node's `voice_preset` enum, so any
+# OpenAI name is rejected before it reaches the model:
+#   Value not in list: voice_preset: 'alloy' not in ['None (Zero-shot / ...)', ...]
+# The bundled workflow selects the VoiceDesign variant, which internally forces
+# voice_preset to "None (Zero-shot / Custom)" no matter what arrives - so an
+# OpenAI speaker name carries no usable information here. Drop it and let
+# `instructions` drive the voice; genuine engine presets still pass through.
+# Both lists are overridable per-upstream via config.yaml (audio.extras).
+_DEFAULT_OPENAI_VOICES = frozenset(
+    {
+        "alloy", "ash", "ballad", "coral", "echo", "fable",
+        "nova", "onyx", "sage", "shimmer", "verse",
+    }
+)
+_DEFAULT_QWEN3_VOICE_PRESETS = (
+    "None (Zero-shot / Custom)",
+    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+    "Ryan", "Aiden", "Ono_Anna", "Sohee",
+)
+
 _VIDEO_STATUS_MAP = {
     "pending": "queued",
     "queued": "queued",
@@ -100,6 +121,33 @@ _VIDEO_STATUS_MAP = {
 
 def _map_video_status(raw: str) -> str:
     return _VIDEO_STATUS_MAP.get(raw, raw)
+
+
+def _audio_voice_lists(up_cfg) -> tuple[frozenset[str], dict[str, str]]:
+    """Voice names the audio adapter accepts, falling back to built-in lists.
+
+    Returns (openai_names, engine_presets) where `engine_presets` maps a
+    lower-cased preset name onto its canonical spelling. Matches are
+    case-insensitive because clients send things like "alloy" vs "Alloy".
+    """
+    extras = getattr(up_cfg, "extras", None) or {}
+
+    raw_openai = extras.get("openai_voices")
+    openai_names = (
+        {str(v).strip().lower() for v in raw_openai if str(v).strip()}
+        if raw_openai
+        else _DEFAULT_OPENAI_VOICES
+    )
+
+    raw_presets = extras.get("voice_presets")
+    presets_src = raw_presets if raw_presets else _DEFAULT_QWEN3_VOICE_PRESETS
+    presets: dict[str, str] = {}
+    for entry in presets_src:
+        name = str(entry).strip()
+        if name:
+            presets[name.lower()] = name
+
+    return frozenset(openai_names), presets
 
 
 def _video_progress(status: str) -> int:
@@ -493,6 +541,24 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
                     "invalid 'response_format': upstream expects one of "
                     "b64_json, url, file, path (it selects delivery mode, "
                     "not the codec)"
+                )
+
+        openai_voices, engine_presets = _audio_voice_lists(up_cfg)
+        voice = body.get("voice")
+        if isinstance(voice, str):
+            key = voice.strip().lower()
+            if key in openai_voices:
+                log.debug("audio: dropping OpenAI voice=%s (ignored upstream)", voice)
+                body.pop("voice")
+            elif key in engine_presets:
+                body["voice"] = engine_presets[key]
+            else:
+                allowed = ", ".join(engine_presets.values())
+                return _bad_request(
+                    "invalid 'voice': upstream has no such engine preset. "
+                    f"Valid values: {allowed}. OpenAI speaker names are dropped "
+                    "automatically because this workflow runs the VoiceDesign "
+                    "variant, where the voice comes from 'instructions'."
                 )
 
         text = body.get("input")
