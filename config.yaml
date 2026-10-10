@@ -74,14 +74,27 @@ video:
 # Audio / TTS upstream (port 10003, route POST /v1/audio/speech).
 # Payload: {"model": ..., "input": <text to speak>,
 #           "instructions": <voice description>}
-# `instructions` is the voice-design reference text and MUST be at least 10
-# characters, otherwise the upstream rejects the request with
-# "Reference text must contain at least 10 characters".
+#
+# Two upstream quirks the gateway already normalizes for you:
+#
+# 1. `response_format` is NOT a codec here. Upstream uses it to pick the
+#    DELIVERY MODE (b64_json / url / file / path); the codec is fixed by
+#    the workflow's SaveAudio node (mp3). OpenAI clients send a codec
+#    (mp3 / opus / aac / flac / wav / pcm) - the gateway drops it so the
+#    request stops 400-ing. Pass a real delivery mode to override.
+#
+# 2. `input` MUST be >= 10 characters. Upstream feeds it to the voice
+#    designer as the reference text; shorter input raises
+#    "Reference text must contain at least 10 characters".
+#    `instructions` has no length limit.
 # ---------------------------------------------------------------------------
 audio:
   base_url: "http://192.168.31.197:10003"
   api_key: ""
   timeout: 600
-  serialize: false
+  # Batched TTS is a real use case (building a voice library), and the
+  # upstream collapses concurrent jobs into one - set false only if you
+  # serialize callers yourself.
+  serialize: true
   models:
     qwen3-tts-voice-design: "qwen3-tts-voice-design"

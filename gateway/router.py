@@ -74,6 +74,19 @@ def _upstream_url(base: str, request: Request) -> str:
     return f"{base}{path}"
 
 
+# OpenAI's TTS `response_format` is a CODEC (mp3/opus/aac/flac/wav/pcm).
+# Upstream reuses the same field name for the DELIVERY MODE
+# (b64_json/url/file/path) - the codec is fixed by the workflow's
+# SaveAudio node. Sending a codec therefore always 400s, so translate it.
+_AUDIO_CODECS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
+_UPSTREAM_AUDIO_DELIVERY = {"b64_json", "url", "file", "path"}
+
+# Upstream feeds `input` to the voice designer as the reference text and
+# rejects anything shorter ("Reference text must contain at least 10
+# characters"). Fail fast here with a readable message instead of letting
+# ComfyUI blow up three layers down.
+_MIN_AUDIO_INPUT_CHARS = 10
+
 _VIDEO_STATUS_MAP = {
     "pending": "queued",
     "queued": "queued",
@@ -440,6 +453,75 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
             result["error"] = {"message": str(data.get("error") or "generation failed"),
                                "code": "generation_failed"}
         return JSONResponse(result)
+
+    @app.post("/v1/audio/speech")
+    async def audio_speech(request: Request):
+        """TTS: adapt the OpenAI-style payload, then proxy upstream.
+
+        Registered before the generic /v1/audio/{subpath} mount so it wins.
+        """
+        denied = _guard(request)
+        if denied:
+            return denied
+        if "audio" not in cfg.upstreams:
+            return _bad_request("no 'audio' upstream configured in config.yaml")
+
+        try:
+            body = json.loads(await request.body())
+        except (ValueError, TypeError):
+            return _bad_request("invalid JSON body")
+        if not isinstance(body, dict):
+            return _bad_request("JSON body must be an object")
+
+        up_cfg = cfg.upstreams["audio"]
+        client = up.get_client(cfg, "audio")
+
+        if body.get("model"):
+            body["model"] = up_cfg.resolve_model(body["model"])
+
+        # OpenAI clients send a codec; upstream expects a delivery mode.
+        # A codec is never valid upstream, so drop it and let upstream use
+        # its default delivery. A real delivery value passes through.
+        fmt = body.get("response_format")
+        if isinstance(fmt, str):
+            lowered = fmt.strip().lower()
+            if lowered in _AUDIO_CODECS:
+                log.debug("audio: dropping OpenAI codec response_format=%s", fmt)
+                body.pop("response_format")
+            elif lowered not in _UPSTREAM_AUDIO_DELIVERY:
+                return _bad_request(
+                    "invalid 'response_format': upstream expects one of "
+                    "b64_json, url, file, path (it selects delivery mode, "
+                    "not the codec)"
+                )
+
+        text = body.get("input")
+        if not text:
+            return _bad_request("'input' is required")
+        if isinstance(text, str) and len(text.strip()) < _MIN_AUDIO_INPUT_CHARS:
+            return _bad_request(
+                "'input' must be at least %d characters: upstream uses it as "
+                "the voice-design reference text" % _MIN_AUDIO_INPUT_CHARS
+            )
+
+        url = f"{client._raw_base}/v1/audio/speech"
+
+        async def _create():
+            resp = await client.post(url, json=body)
+            if resp.status_code != 200:
+                return _upstream_error(resp)
+            ct = resp.headers.get("content-type", "")
+            if ct.startswith("application/json"):
+                data = resp.json()
+                if isinstance(data, dict) and isinstance(data.get("model"), str):
+                    data["model"] = up_cfg.to_client_name(data["model"])
+                return JSONResponse(data)
+            return Response(content=resp.content, status_code=200, media_type=ct)
+
+        if not up_cfg.serialize:
+            return await _create()
+        async with up.get_lock("audio"):
+            return await _create()
 
     # -- data-driven proxy mounts ------------------------------------------
     # Registered for every configured category, so adding a section to
