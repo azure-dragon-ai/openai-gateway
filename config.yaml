@@ -98,25 +98,8 @@ audio:
   serialize: true
   models:
     qwen3-tts-voice-design: "qwen3-tts-voice-design"
-
-  # -- voice field adapter -------------------------------------------------
-  # OpenAI clients send `voice` = one of OpenAI's speaker names. Upstream pipes
-  # it into Qwen3-TTS's `voice_preset` enum, which only accepts its own presets,
-  # so a raw OpenAI name is rejected outright. This workflow runs the
-  # VoiceDesign variant, where the engine forces voice_preset to
-  # "None (Zero-shot / Custom)" anyway - the voice is fully described by
-  # `instructions`. So: names listed here are DROPPED, anything else must be a
-  # valid engine preset or the request is rejected with the valid list.
-  # Leave either list unset to fall back to the built-in defaults.
-  openai_voices: [alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse]
-  voice_presets:                       # must match Qwen3TTSEngineNode's enum
-    - "None (Zero-shot / Custom)"
-    - Vivian
-    - Serena
-    - Uncle_Fu
-    - Dylan
-    - Eric
-    - Ryan
-    - Aiden
-    - Ono_Anna
-    - Sohee
+  # NOTE: `voice` is ignored by the gateway. This workflow runs the VoiceDesign
+  # variant, where the engine forces `voice_preset` to "None (Zero-shot /
+  # Custom)" regardless - the voice is fully described by `instructions`.
+  # Passing a voice name (OpenAI's alloy/echo/... especially) would only be
+  # rejected upstream, so the field is dropped instead of forwarded.

@@ -36,8 +36,7 @@ class UpstreamConfig:
     models: dict[str, str] = field(default_factory=dict)
     serialize: bool = False
     #: Any yaml key beyond the ones above. Lets a category carry its own
-    #: adapter settings (e.g. audio's voice whitelists) without touching this
-    #: parser every time.
+    #: adapter settings without touching this parser every time.
     extras: dict[str, Any] = field(default_factory=dict)
 
     def resolve_model(self, client_model: str) -> str:
