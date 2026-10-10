@@ -7,13 +7,15 @@ so every subpath is a transparent passthrough:
   GET  /health
   GET  /v1/models
   POST /v1/chat/completions           (streaming SSE + non-streaming)
-  POST /v1/videos                     (OpenAI video format: create async task)
-  GET  /v1/videos/{task_id}           (OpenAI video format: task status)
-  GET  /v1/videos/{task_id}/content   (OpenAI video format: proxy download)
-  POST /v1/images/{subpath:path}      (transparent proxy, e.g. /generations)
-  GET  /v1/images/{subpath:path}      (transparent proxy, e.g. /tasks/{id})
-  POST /v1/videos/{subpath:path}      (transparent proxy, e.g. /generations)
-  GET  /v1/videos/{subpath:path}      (transparent proxy, e.g. /tasks/{id})
+  POST /v1/videos                      (OpenAI video format: create async task)
+  GET  /v1/videos/{task_id}            (OpenAI video format: task status)
+  GET  /v1/videos/{task_id}/content    (OpenAI video format: proxy download)
+  POST /v1/audio/speech                (TTS, proxied to the audio upstream)
+  POST /v1/{category}/{subpath:path}   (transparent proxy, e.g. /generations)
+  GET  /v1/{category}/{subpath:path}   (transparent proxy, e.g. /tasks/{id})
+
+Category -> URL prefix mapping is data-driven: any section in config.yaml
+that carries a base_url gets its own proxy mount point.
 """
 from __future__ import annotations
 
@@ -31,6 +33,13 @@ from . import upstream as up
 from .config import GatewayConfig
 
 log = logging.getLogger("openai-gateway")
+
+#: Category -> URL prefix mounted under /v1. `chat` is special-cased above.
+CATEGORY_PREFIX: dict[str, str] = {
+    "image": "/v1/images",
+    "video": "/v1/videos",
+    "audio": "/v1/audio",
+}
 
 
 def _unauthorized() -> JSONResponse:
@@ -100,7 +109,7 @@ def _output_urls(data: dict) -> list:
 
 def _parse_multipart_fields(raw: bytes, content_type: str) -> dict:
     """Parse multipart/form-data into a flat dict of text fields."""
-    m = re.search(r"boundary=(\"([^\"]+)\"|([^;]+))", content_type)
+    m = re.search(r'boundary=(\"([^\"]+)\"|([^;]+))', content_type)
     if not m:
         return {}
     boundary = ("--" + (m.group(2) or m.group(3))).encode("latin-1")
@@ -128,7 +137,7 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
         yield
         await up.close_all()
 
-    app = FastAPI(title="openai-gateway", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="openai-gateway", version="1.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -146,20 +155,28 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
                 key = auth[7:].strip()
         return key == cfg.server.api_key
 
+    def _guard(request: Request):
+        return None if _auth_ok(request) else _unauthorized()
+
     @app.get("/health")
     async def health() -> dict:
         return {
             "status": "ok",
             "upstreams": {
-                name: {"base_url": c.base_url, "models": list(c.models)}
+                name: {
+                    "base_url": c.base_url,
+                    "models": list(c.models),
+                    "serialize": c.serialize,
+                }
                 for name, c in cfg.upstreams.items()
             },
         }
 
     @app.get("/v1/models")
     async def list_models(request: Request):
-        if not _auth_ok(request):
-            return _unauthorized()
+        denied = _guard(request)
+        if denied:
+            return denied
         data = [
             {"id": model, "object": "model", "created": 0, "owned_by": category}
             for category, c in cfg.upstreams.items()
@@ -169,8 +186,9 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        if not _auth_ok(request):
-            return _unauthorized()
+        denied = _guard(request)
+        if denied:
+            return denied
         body = await request.json()
         chat_cfg = cfg.chat
         model = body.get("model")
@@ -215,10 +233,8 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
             data["model"] = chat_cfg.to_client_name(data["model"])
         return JSONResponse(data)
 
-    async def _proxy(request: Request, category: str, subpath: str):
-        """Transparent proxy: forward the client's /v1 path verbatim."""
-        if not _auth_ok(request):
-            return _unauthorized()
+    async def _dispatch(request: Request, category: str):
+        """Perform the upstream call for a proxy request."""
         up_cfg = cfg.upstreams[category]
         client = up.get_client(cfg, category)
         target = _upstream_url(client._raw_base, request)
@@ -260,11 +276,28 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
             media_type=ct,
         )
 
+    async def _proxy(request: Request, category: str, subpath: str = ""):
+        """Transparent proxy: forward the client's /v1 path verbatim."""
+        denied = _guard(request)
+        if denied:
+            return denied
+        up_cfg = cfg.upstreams[category]
+
+        # Generation endpoints for a serialized category must run one at a
+        # time; status polls (GET) are cheap and must not queue behind them.
+        needs_lock = up_cfg.serialize and request.method in ("POST", "PUT")
+        if not needs_lock:
+            return await _dispatch(request, category)
+
+        async with up.get_lock(category):
+            return await _dispatch(request, category)
+
     @app.post("/v1/videos")
     async def videos_create(request: Request):
         """OpenAI video format: create an async video task."""
-        if not _auth_ok(request):
-            return _unauthorized()
+        denied = _guard(request)
+        if denied:
+            return denied
         raw = await request.body()
         content_type = request.headers.get("content-type", "")
         if content_type.startswith("application/json"):
@@ -295,33 +328,45 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
                 body["duration"] = min(int(str(body["seconds"]).strip()), 15)
             except ValueError:
                 return _bad_request("'seconds' must be an integer number of seconds")
+        seconds = body.get("seconds")
+        size = body.get("size")
         body.pop("seconds", None)
+
         client = up.get_client(cfg, "video")
-        resp = await client.post(f"{client._raw_base}/v1/videos/generations", json=body)
-        if resp.status_code != 200:
-            return _upstream_error(resp)
-        data = resp.json()
-        status = _map_video_status(data.get("status", "pending"))
-        result = {
-            "id": data.get("id"),
-            "task_id": data.get("id"),
-            "object": "video",
-            "model": up_cfg.to_client_name(body["model"]),
-            "status": status,
-            "progress": _video_progress(status),
-            "created_at": data.get("created_at", int(time.time())),
-        }
-        if body.get("seconds") is not None:
-            result["seconds"] = body["seconds"]
-        if body.get("size") is not None:
-            result["size"] = body["size"]
-        return JSONResponse(result)
+        url = f"{client._raw_base}/v1/videos/generations"
+
+        async def _create():
+            resp = await client.post(url, json=body)
+            if resp.status_code != 200:
+                return _upstream_error(resp)
+            data = resp.json()
+            status = _map_video_status(data.get("status", "pending"))
+            result = {
+                "id": data.get("id"),
+                "task_id": data.get("id"),
+                "object": "video",
+                "model": up_cfg.to_client_name(body["model"]),
+                "status": status,
+                "progress": _video_progress(status),
+                "created_at": data.get("created_at", int(time.time())),
+            }
+            if seconds is not None:
+                result["seconds"] = seconds
+            if size is not None:
+                result["size"] = size
+            return JSONResponse(result)
+
+        if not up_cfg.serialize:
+            return await _create()
+        async with up.get_lock("video"):
+            return await _create()
 
     @app.get("/v1/videos/{task_id}/content")
     async def videos_content(task_id: str, request: Request):
         """OpenAI video format: proxy download of the finished video."""
-        if not _auth_ok(request):
-            return _unauthorized()
+        denied = _guard(request)
+        if denied:
+            return denied
         client = up.get_client(cfg, "video")
         resp = await client.get(f"{client._raw_base}/v1/videos/tasks/{task_id}")
         if resp.status_code != 200:
@@ -362,8 +407,9 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
     @app.get("/v1/videos/{task_id}")
     async def videos_status(task_id: str, request: Request):
         """OpenAI video format: task status / video object."""
-        if not _auth_ok(request):
-            return _unauthorized()
+        denied = _guard(request)
+        if denied:
+            return denied
         client = up.get_client(cfg, "video")
         resp = await client.get(f"{client._raw_base}/v1/videos/tasks/{task_id}")
         if resp.status_code == 404:
@@ -395,20 +441,38 @@ def create_app(cfg: GatewayConfig) -> FastAPI:
                                "code": "generation_failed"}
         return JSONResponse(result)
 
-    @app.post("/v1/images/{subpath:path}")
-    async def images_post(request: Request, subpath: str):
-        return await _proxy(request, "image", subpath)
+    # -- data-driven proxy mounts ------------------------------------------
+    # Registered for every configured category, so adding a section to
+    # config.yaml is enough to expose its endpoint (no code change needed).
+    for _category, _prefix in CATEGORY_PREFIX.items():
+        if _category not in cfg.upstreams:
+            continue
 
-    @app.get("/v1/images/{subpath:path}")
-    async def images_get(request: Request, subpath: str):
-        return await _proxy(request, "image", subpath)
+        def _make(cat: str):
+            async def _handler(request: Request, subpath: str):
+                return await _proxy(request, cat, subpath)
 
-    @app.post("/v1/videos/{subpath:path}")
-    async def videos_post(request: Request, subpath: str):
-        return await _proxy(request, "video", subpath)
+            return _handler
 
-    @app.get("/v1/videos/{subpath:path}")
-    async def videos_get(request: Request, subpath: str):
-        return await _proxy(request, "video", subpath)
+        app.post(f"{_prefix}/{{subpath:path}}")(_make(_category))
+        app.get(f"{_prefix}/{{subpath:path}}")(_make(_category))
 
+    # Categories without a prefix in CATEGORY_PREFIX fall back to /v1/<name>.
+    for _category in cfg.upstreams:
+        if _category in CATEGORY_PREFIX or _category == "chat":
+            continue
+
+        def _make_extra(cat: str):
+            async def _handler(request: Request, subpath: str):
+                return await _proxy(request, cat, subpath)
+
+            return _handler
+
+        app.post(f"/v1/{_category}/{{subpath:path}}")(_make_extra(_category))
+        app.get(f"/v1/{_category}/{{subpath:path}}")(_make_extra(_category))
+
+    log.info(
+        "gateway routes ready (categories: %s)",
+        ", ".join(f"{c}={len(u.models)}" for c, u in cfg.upstreams.items()),
+    )
     return app

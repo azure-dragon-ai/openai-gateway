@@ -3,6 +3,13 @@
 # Each capability routes to its own upstream with an independent
 # base_url / api_key / model mapping. base_url should be the OpenAI-style
 # API root including /v1 (subpaths are appended to it).
+#
+# `serialize: true` forces that category's *generation* requests to run one
+# at a time. The upstream ComfyUI collapses concurrent jobs for the same
+# workflow into a single run and hands the SAME artifact back to every
+# caller — serializing is what keeps batched requests from silently
+# receiving duplicates. Set it to false only if you handle concurrency
+# upstream yourself. Status polls (GET) never queue behind generations.
 
 server:
   host: 0.0.0.0
@@ -11,26 +18,70 @@ server:
 
 chat:
   base_url: "http://[2408:8207:60ad:6cb0:706b:f65c:1fb2:4b01]:8000"
-  api_key: "not-needed"
+  api_key: "96cd885dc296a9244491e92cc10eb0c213103bf8d70798cb6ef543e06a42d4dc"
   timeout: 900
   models:
-    qwen3.8-27b: "Qwen3.8-27B"
+    Qwen3.6-35B-A3B: "Qwen3.6-35B-A3B"
+    Qwen3.8-27B: "Qwen3.8-27B"
 
+# ---------------------------------------------------------------------------
+# Image upstream (port 10004). All 12 models below are declared by the
+# upstream with mode=image and are served through /v1/images/*.
+# ---------------------------------------------------------------------------
 image:
-  base_url: "http://192.168.31.197:10003"
+  base_url: "http://192.168.31.197:10004"
   api_key: ""
   timeout: 600
+  serialize: true
   models:
+    # --- text-to-image ---
     z-image: "z-image"
-    z-image-turbo: "z-image-turbo"
-    minimax-h3: "minimax-h3"
-    minimax-h3-turbo: "minimax-h3-turbo"
+    z-image-turbo: "z-image-turbo"                 # fastest, ~7s @ 1080x1920
+    qwen-image-2.1: "qwen-image-2.1"
+    boogu-image-base: "boogu-image-base"
+    boogu-image-base-4step: "boogu-image-base-4step"
+    boogu-image-turbo: "boogu-image-turbo"
+    # --- image-to-image / editing (these need an input image) ---
+    boogu-image-edit: "boogu-image-edit"
+    boogu-image-edit-turbo: "boogu-image-edit-turbo"
+    flux2-klein-image-edit-turbo: "flux2-klein-image-edit-turbo"
+    # --- utilities (still mode=image, need an input image) ---
+    utility-birefnet-remove-background: "utility-birefnet-remove-background"
+    utility-seedvr2-upscale: "utility-seedvr2-upscale"
+    utility-sam3-segment: "utility-sam3-segment"
 
+# ---------------------------------------------------------------------------
+# Video upstream (port 10003).
+# NOTE: minimax-h3-turbo was removed upstream and is intentionally absent.
+# Current upstream status (2026-10-10): the minimax-h3 workflows fail with
+#   "Node 'FFN 分块' not found. The custom node may not be installed."
+# i.e. video generation is broken on the ComfyUI side, not in this gateway.
+# ---------------------------------------------------------------------------
 video:
   base_url: "http://192.168.31.197:10003"
   api_key: ""
   timeout: 1800
+  serialize: true
   models:
-    z-image-turbo: "z-image-turbo"
+    # --- text-to-video ---
     minimax-h3: "minimax-h3"
-    minimax-h3-turbo: "minimax-h3-turbo"
+    # --- image-to-video / reference-conditioned (needs an input image) ---
+    minimax-h3-edit: "minimax-h3-edit"
+    minimax-h3-lift: "minimax-h3-lift"
+    minimax-h3-lift-edit: "minimax-h3-lift-edit"
+
+# ---------------------------------------------------------------------------
+# Audio / TTS upstream (port 10003, route POST /v1/audio/speech).
+# Payload: {"model": ..., "input": <text to speak>,
+#           "instructions": <voice description>}
+# `instructions` is the voice-design reference text and MUST be at least 10
+# characters, otherwise the upstream rejects the request with
+# "Reference text must contain at least 10 characters".
+# ---------------------------------------------------------------------------
+audio:
+  base_url: "http://192.168.31.197:10003"
+  api_key: ""
+  timeout: 600
+  serialize: false
+  models:
+    qwen3-tts-voice-design: "qwen3-tts-voice-design"

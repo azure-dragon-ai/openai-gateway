@@ -1,11 +1,17 @@
 """Shared async upstream clients (one per capability category)."""
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import httpx
 
 from .config import GatewayConfig
 
+log = logging.getLogger("openai-gateway")
+
 _CLIENTS: dict[str, httpx.AsyncClient] = {}
+_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def get_client(cfg: GatewayConfig, category: str) -> httpx.AsyncClient:
@@ -30,7 +36,23 @@ def get_client(cfg: GatewayConfig, category: str) -> httpx.AsyncClient:
     return client
 
 
+def get_lock(category: str) -> asyncio.Lock:
+    """Return the per-category serialization lock.
+
+    Upstream ComfyUI collapses concurrent generation requests for the same
+    workflow into ONE job and returns the identical result to every caller.
+    Any category flagged `serialize: true` is therefore queued here so
+    callers never silently receive a duplicate artifact.
+    """
+    lock = _LOCKS.get(category)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LOCKS[category] = lock
+    return lock
+
+
 async def close_all() -> None:
     for client in _CLIENTS.values():
         await client.aclose()
     _CLIENTS.clear()
+    _LOCKS.clear()
